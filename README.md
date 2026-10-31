@@ -1,4 +1,316 @@
 # Kubernetes Cluster Setup Using kubeadm on AWS EC2 – Amazon Linux 2023
+Architecture: 1 control-plane EC2 + 2 worker EC2 nodes; containerd runtime; Calico CNI; Nginx NodePort demo. This is a learning environment, not a production high-availability design.
+
+# 1. Lab Configuration
+
+| Setting           | Value                                               |
+|-------------------|-----------------------------------------------------|
+| AWS Region        | us-east-1 (N. Virginia)                             |
+| Availability Zone | us-east-1a (choose an available AZ in your account) |
+| VPC               | kubeadm-vpc — 10.0.0.0/16                           |
+| Subnet            | kubeadm-public-subnet — 10.0.1.0/24                 |
+| Internet Gateway  | kubeadm-igw                                         |
+| Route table       | kubeadm-public-rt                                   |
+| Security Group    | kubeadm-sg                                          |
+| AMI               | Amazon Linux 2023 x86_64                            |
+| EC2               | 3 × t3.medium, 20 GiB gp3 each                      |
+| Key pair          | eks (private file: eks.pem)                         |
+| Kubernetes        | v1.34 (all nodes same minor version)                |
+| Pod network       | 192.168.0.0/16                                      |
+| Container runtime | containerd                                          |
+| CNI               | Calico                                              |
+
+| Node    | Private IP (assign at launch) | Role          |
+|---------|-------------------------------|---------------|
+| master  | 10.0.1.10                     | Control plane |
+| worker1 | 10.0.1.11                     | Worker        |
+| worker2 | 10.0.1.12                     | Worker        |
+
+All private IPs are examples that must be assigned explicitly at EC2 launch, or replaced consistently with the actual EC2 private addresses. The pod CIDR must not overlap with VPC networks.
+
+# 2. Create VPC
+
+AWS Console → switch region to US East (N. Virginia) → VPC → Your VPCs → Create VPC. Choose VPC only; name kubeadm-vpc; IPv4 CIDR 10.0.0.0/16; no IPv6; default tenancy. Create and confirm Available.
+
+# 3. Create Public Subnet
+
+VPC → Subnets → Create subnet. VPC kubeadm-vpc; name kubeadm-public-subnet; AZ us-east-1a; IPv4 10.0.1.0/24. After creation: Actions → Edit subnet settings → Enable auto-assign public IPv4 address.
+
+# 4. Internet Gateway and Route Table
+
+VPC → Internet Gateways → Create: kubeadm-igw. Attach to kubeadm-vpc. Then VPC → Route Tables → Create: kubeadm-public-rt in kubeadm-vpc. Add default route 0.0.0.0/0 → kubeadm-igw; retain local route 10.0.0.0/16 → local. Associate kubeadm-public-subnet with this route table.
+
+# 5. Security Group
+
+EC2 → Security Groups → Create kubeadm-sg in kubeadm-vpc. Set inbound SSH TCP 22 from My IP only. Add All traffic from source kubeadm-sg (self-reference) for internal node-to-node communication. For browser testing, optionally allow TCP 30000–32767 from My IP. Retain outbound allow all for this lab. Never allow SSH or Kubernetes control-plane ports from 0.0.0.0/0.
+
+The internal self-reference covers API 6443, etcd 2379–2380, kubelet 10250, scheduler/controller manager and Calico encapsulation. Restrict further only after validating the exact CNI mode and port/protocol requirements.
+
+# 6. Key Pair in us-east-1
+
+EC2 key pairs are region-specific. In us-east-1, create key pair named eks (RSA, PEM) or import the public key matching an existing eks.pem. Keep the private key secure. To derive a public key on macOS:
+
+cd ~/Downloads  
+chmod 400 eks.pem  
+ssh-keygen -y -f eks.pem \> eks.pub
+
+Then EC2 → Key Pairs → Import key pair → name eks → upload eks.pub. Do not upload eks.pem.
+
+# 7. Launch Three EC2 Instances
+
+EC2 → Launch instances. Use Amazon Linux 2023 AMI (x86_64), t3.medium, key pair eks, VPC kubeadm-vpc, subnet kubeadm-public-subnet, public IP enabled, security group kubeadm-sg and 20 GiB gp3 root volume. Launch master, worker1 and worker2. Under Advanced network configuration set primary private IP to 10.0.1.10, .11 and .12 respectively, or substitute the assigned IPs throughout. Wait for 2/2 status checks.
+
+# 8. SSH and Hostnames
+
+On your Mac, in separate terminal tabs:
+
+cd ~/Downloads  
+chmod 400 eks.pem  
+ssh -i eks.pem ec2-user@\<master-public-ip\>  
+ssh -i eks.pem ec2-user@\<worker1-public-ip\>  
+ssh -i eks.pem ec2-user@\<worker2-public-ip\>
+
+Run the following on the corresponding nodes (one command per node):
+
+sudo hostnamectl set-hostname master \# master only  
+sudo hostnamectl set-hostname worker1 \# worker1 only  
+sudo hostnamectl set-hostname worker2 \# worker2 only
+
+On ALL nodes, append the actual node private IP/name mappings to /etc/hosts (do not replace the existing localhost entries):
+
+cat \<\<'EOF' \| sudo tee -a /etc/hosts  
+10.0.1.10 master  
+10.0.1.11 worker1  
+10.0.1.12 worker2  
+EOF  
+hostname  
+hostname -I  
+getent hosts master worker1 worker2
+
+# 9. OS Prerequisites — All Three Nodes
+
+sudo dnf update -y  
+sudo dnf install -y curl wget tar conntrack-tools socat iproute-tc  
+sudo swapoff -a  
+sudo sed -i '/\sswap\s/s/^/#/' /etc/fstab  
+free -h
+
+## Kernel modules and sysctl
+
+cat \<\<'EOF' \| sudo tee /etc/modules-load.d/k8s.conf  
+overlay  
+br_netfilter  
+EOF  
+sudo modprobe overlay  
+sudo modprobe br_netfilter  
+cat \<\<'EOF' \| sudo tee /etc/sysctl.d/k8s.conf  
+net.bridge.bridge-nf-call-iptables = 1  
+net.bridge.bridge-nf-call-ip6tables = 1  
+net.ipv4.ip_forward = 1  
+EOF  
+sudo sysctl --system  
+sysctl net.ipv4.ip_forward
+
+## SELinux
+
+Check with getenforce. If enforcing, permissive mode is acceptable for this disposable lab; do not use it as a blanket production recommendation.
+
+getenforce  
+\# Only if Enforcing:  
+sudo setenforce 0  
+sudo sed -i 's/^SELINUX=enforcing\$/SELINUX=permissive/' /etc/selinux/config
+
+# 10. Install containerd — All Nodes
+
+Check availability of the containerd package in your AL2023 repositories. If unavailable, use a compatible vendor package for your architecture rather than installing an arbitrary Docker daemon.
+
+sudo dnf list --available containerd  
+sudo dnf install -y containerd  
+sudo mkdir -p /etc/containerd  
+containerd config default \| sudo tee /etc/containerd/config.toml \> /dev/null  
+sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml  
+grep -nE 'SystemdCgroup\|disabled_plugins' /etc/containerd/config.toml  
+sudo systemctl enable --now containerd  
+sudo systemctl restart containerd  
+sudo systemctl status containerd  
+containerd --version
+
+Confirm CRI is enabled (not listed under disabled_plugins) and systemd cgroups are enabled. The containerd configuration syntax varies by major version; inspect the generated file before editing.
+
+# 11. Install kubeadm, kubelet, kubectl — All Nodes
+
+cat \<\<'EOF' \| sudo tee /etc/yum.repos.d/kubernetes.repo  
+\[kubernetes\]  
+name=Kubernetes  
+baseurl=https://pkgs.k8s.io/core:/stable:/v1.34/rpm/  
+enabled=1  
+gpgcheck=1  
+gpgkey=https://pkgs.k8s.io/core:/stable:/v1.34/rpm/repodata/repomd.xml.key  
+exclude=kubelet kubeadm kubectl cri-tools kubernetes-cni  
+EOF  
+sudo dnf install -y kubelet kubeadm kubectl --disableexcludes=kubernetes  
+sudo systemctl enable --now kubelet  
+kubeadm version  
+kubelet --version  
+kubectl version --client
+
+Kubelet may restart until the node is initialized or joined. Use the same Kubernetes minor version on every node.
+
+# 12. Initialize Control Plane — Master Only
+
+hostname -I  
+sudo kubeadm init \\  
+--apiserver-advertise-address=10.0.1.10 \\  
+--pod-network-cidr=192.168.0.0/16 \\  
+--cri-socket=unix:///run/containerd/containerd.sock
+
+Replace 10.0.1.10 if the master has a different private IP. Save the join command printed at the end of initialization.
+
+mkdir -p "\$HOME/.kube"  
+sudo cp /etc/kubernetes/admin.conf "\$HOME/.kube/config"  
+sudo chown "\$(id -u):\$(id -g)" "\$HOME/.kube/config"  
+chmod 600 "\$HOME/.kube/config"  
+kubectl cluster-info  
+kubectl get nodes  
+kubectl get pods -A
+
+The master can be NotReady until CNI is installed. Protect ~/.kube/config because it contains cluster-admin credentials.
+
+# 13. Install Calico CNI — Master Only
+
+curl -fsSLo calico.yaml https://raw.githubusercontent.com/projectcalico/calico/v3.30.3/manifests/calico.yaml  
+grep -nE "CALICO_IPV4POOL_CIDR\|CALICO_IPV4POOL_IPIP\|CALICO_IPV4POOL_VXLAN" calico.yaml  
+kubectl apply -f calico.yaml  
+kubectl get pods -n kube-system  
+kubectl get nodes -w
+
+This example uses the Calico manifest for the 192.168.0.0/16 pod network. Confirm the manifest configuration and CNI compatibility before use. The security-group self-reference allows node-to-node Calico traffic.
+
+# 14. Join Workers — Worker1 and Worker2
+
+On master generate a fresh join command:
+
+kubeadm token create --print-join-command
+
+On EACH worker, run the generated command with sudo; replace the placeholders below with actual generated values:
+
+sudo kubeadm join 10.0.1.10:6443 \\  
+--token \<generated-token\> \\  
+--discovery-token-ca-cert-hash sha256:\<generated-hash\>
+
+Verify from master:
+
+kubectl get nodes -o wide  
+kubectl get pods -A
+
+Expected: master Ready control-plane, worker1 Ready, worker2 Ready. If a node remains NotReady, inspect kubelet logs, CNI pods and security-group rules.
+
+# 15. Deploy Nginx and Expose NodePort — Master Only
+
+kubectl create deployment nginx --image=nginx  
+kubectl scale deployment nginx --replicas=3  
+kubectl rollout status deployment/nginx  
+kubectl get pods -o wide  
+kubectl expose deployment nginx --type=NodePort --port=80 --target-port=80  
+kubectl get svc nginx
+
+Find the assigned port (normally 30000–32767). Browse http://\<worker-public-ip\>:\<node-port\>. Ensure the SG allows that port from your IP. The example port 31245 is illustrative, not guaranteed.
+
+# 16. Practical Kubernetes Exercises
+
+## Namespaces and Deployment
+
+kubectl create namespace production  
+kubectl create deployment webapp --image=nginx -n production  
+kubectl scale deployment webapp --replicas=3 -n production  
+kubectl get pods -n production -o wide
+
+## Scaling and Self-Healing
+
+kubectl scale deployment nginx --replicas=5  
+kubectl get pods -o wide  
+kubectl delete pod \<nginx-pod-name\>  
+kubectl get pods -w
+
+## Worker Maintenance
+
+kubectl cordon worker1  
+kubectl drain worker1 --ignore-daemonsets --delete-emptydir-data  
+kubectl get pods -o wide  
+kubectl uncordon worker1
+
+## Observability
+
+kubectl get events -A  
+kubectl describe node worker1  
+kubectl logs deployment/nginx  
+kubectl get pods -A -o wide
+
+# 17. Troubleshooting
+
+| Symptom             | Check                                           |
+|---------------------|-------------------------------------------------|
+| Node NotReady       | kubectl describe node worker1                   |
+| Kubelet failing     | sudo journalctl -u kubelet -n 100 --no-pager    |
+| containerd issue    | sudo journalctl -u containerd -n 100 --no-pager |
+| CNI issue           | kubectl get pods -n kube-system                 |
+| Pod stuck Pending   | kubectl describe pod \<pod-name\>               |
+| Join token expired  | kubeadm token create --print-join-command       |
+| Service unavailable | kubectl describe svc nginx                      |
+| API network issue   | curl -k https://10.0.1.10:6443                  |
+
+An HTTP authentication-related response from the API endpoint can still indicate the endpoint is reachable. Avoid interpreting it as proof that kubectl credentials work.
+
+# 18. Reset and AWS Cleanup
+
+If rebuilding, drain worker nodes first when practical. Run kubeadm reset on each worker and then on master. This does not completely clean CNI state or networking rules.
+
+sudo kubeadm reset -f  
+\# Master only, after reset:  
+rm -rf ~/.kube
+
+For complete cost cleanup: terminate all three EC2 instances; delete kubeadm-sg after interfaces are released; delete the custom route table; delete the subnet; detach/delete the internet gateway; delete kubeadm-vpc. Retain the eks key pair if used for other labs. Public IPv4 addresses and EC2 resources may incur charges.
+
+# 19. Verification Checklist
+
+☐ VPC, subnet, IGW and routes created
+
+☐ Security group allows restricted SSH and internal node traffic
+
+☐ Three AL2023 EC2 instances running in us-east-1
+
+☐ SSH succeeds using eks.pem
+
+☐ Kernel modules, sysctl and swap configured
+
+☐ containerd active and CRI enabled
+
+☐ Kubernetes tools installed on all nodes
+
+☐ kubeadm init completed on master
+
+☐ Calico networking healthy
+
+☐ Two workers joined and all nodes Ready
+
+☐ Nginx pods running and NodePort reachable
+
+☐ Scaling, pod self-healing and drain tested
+
+☐ AWS resources cleaned up after lab
+
+# References
+
+Kubernetes kubeadm installation: https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/install-kubeadm/
+
+Kubernetes kubeadm cluster creation: https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/create-cluster-kubeadm/
+
+Calico installation: https://docs.tigera.io/calico/latest/getting-started/kubernetes/self-managed-onprem/onpremises
+
+AWS VPC documentation: https://docs.aws.amazon.com/vpc/latest/userguide/what-is-amazon-vpc.html
+
+AWS EC2 key pairs: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-key-pairs.html
+
 
 Region: US East (N. Virginia) – `us-east-1`
 
