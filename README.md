@@ -1,3 +1,44 @@
+# Kubernetes Cluster Setup Using kubeadm on AWS EC2 – Amazon Linux 2023
+
+Region: US East (N. Virginia) – `us-east-1`
+
+The complete guide will use the N. Virginia region throughout, with three Amazon Linux 2023 EC2 instances, the `eks.pem` SSH key, a custom VPC, containerd, Kubernetes v1.34 and Calico networking.
+
+## Final infrastructure configuration
+
+| Component         | Configuration                           |
+| ----------------- | --------------------------------------- |
+| AWS Region        | `us-east-1`                             |
+| Availability Zone | `us-east-1a`                            |
+| VPC               | `kubeadm-vpc` (`10.0.0.0/16`)           |
+| Public Subnet     | `kubeadm-public-subnet` (`10.0.1.0/24`) |
+| Internet Gateway  | `kubeadm-igw`                           |
+| Route Table       | `kubeadm-public-rt`                     |
+| Security Group    | `kubeadm-sg`                            |
+| Master            | `10.0.1.10`                             |
+| Worker 1          | `10.0.1.11`                             |
+| Worker 2          | `10.0.1.12`                             |
+| Instance Type     | `t3.medium`                             |
+| OS                | Amazon Linux 2023                       |
+| SSH Key           | `eks.pem`                               |
+| Pod CIDR          | `192.168.0.0/16`                        |
+
+The full document includes AWS Console steps, commands for each node, verification checkpoints, application deployment exercises, troubleshooting and cleanup.
+
+## Complete document – Ready
+
+I've prepared the full 19-section, 7-page Kubernetes hands-on guide for Amazon Linux 2023 in the N. Virginia (`us-east-1`) region.
+
+Kubernetes kubeadm – Amazon Linux 2023
+
+Word document · 7 pages · AWS VPC, EC2, installation, deployment and troubleshooting
+
+&#x20;Download Complete Word Document
+
+The document includes step-by-step AWS Console configuration, SSH commands using `eks.pem`, all-node and master-only commands, worker joining, Nginx deployment, hands-on exercises, verification and AWS resource cleanup.
+
+
+
 # Complete kubeadm Kubernetes Cluster Setup on AWS EC2 – Amazon Linux 2023
 
 Lab: Self-managed Kubernetes cluster using kubeadm, containerd, and Calico on three Amazon Linux 2023 EC2 instances.
